@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -271,8 +272,9 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload     = params.op_offload;
+    cparams.kv_unified     = params.kv_unified;
+    cparams.moe_cache_size = params.moe_cache_size;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -466,6 +468,22 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        if (cparams.moe_cache_size > 0) {
+            if (cparams.pipeline_parallel || model.n_devices() > 1) {
+                throw std::runtime_error("MoE cache does not support multiple devices");
+            }
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
+                    break;
+                }
+            }
+            if (!moe_cache) {
+                throw std::runtime_error("MoE cache requires a GPU backend");
+            }
         }
 
         sched_reserve();
@@ -2477,6 +2495,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.moe_cache   =*/ moe_cache.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2511,6 +2530,91 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+
+bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+
+    // the slot maps of the MoE cache
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+        return true;
+    }
+
+    auto & st = lctx->copy_experts;
+
+    // the ids must be computed before the split starts, so only the first node of the split is considered
+    if (ggml_graph_n_nodes(graph) == 0) {
+        return false;
+    }
+    const ggml_tensor * node = ggml_graph_node(graph, 0);
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        return false;
+    }
+
+    const ggml_tensor * ids = node->src[2];
+    if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend);
+
+        st.used.assign(n_expert, false);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                st.used[id] = true;
+            }
+        }
+
+        st.ids = ids;
+    }
+
+    // group consecutive experts and copy them together
+    for (int64_t first = 0; first < n_expert; ) {
+        if (!st.used[first]) {
+            first++;
+            continue;
+        }
+        int64_t last = first;
+        while (last + 1 < n_expert && st.used[last + 1]) {
+            last++;
+        }
+
+        // the experts in the MoE cache are copied from device memory, the others are uploaded
+        int64_t next = first;
+        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
+            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+            if (n == 0) {
+                e++;
+                continue;
+            }
+            if (next < e) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+            }
+            e   += n;
+            next = e;
+        }
+
+        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+        const size_t offset  = next*expert_size;
+        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t size    = (last + 1 - next)*expert_size + padding;
+        if (size > 0) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        }
+
+        first = last + 1;
+    }
+
+    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -3284,6 +3388,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (moe_cache) {
+        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -3550,6 +3659,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
