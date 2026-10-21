@@ -620,6 +620,7 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new_ex(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
             cparams.pipeline_parallel, cparams.op_offload, (int) cparams.n_pipeline_copies));
+    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -656,6 +657,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new_ex(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                         false, cparams.op_offload, 1));
+                ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2511,6 +2513,8 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    copy_experts.reset();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3557,6 +3561,7 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
+            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
