@@ -606,6 +606,12 @@ static void test_filters(testing & t) {
         "hello jinja"
     );
 
+    test_template(t, "replace hex escape",
+        "{{ 'hello\\x00 world'|replace('\\x00', '') }}",
+        json::object(),
+        "hello world"
+    );
+
     test_template(t, "length (count alias) list",
         "{{ items|count }}",
         {{"items", json::array({1, 2, 3})}},
