@@ -2,6 +2,7 @@
 #include "runtime.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <string>
@@ -75,6 +76,17 @@ lexer_result lexer::tokenize(const std::string & source) {
                 }
                 // add escaped char
                 char escaped_char = src[pos++];
+                if (escaped_char == 'x') {
+                    if (pos + 2 > src.size() ||
+                        !std::isxdigit(static_cast<unsigned char>(src[pos])) ||
+                        !std::isxdigit(static_cast<unsigned char>(src[pos + 1]))) {
+                        throw lexer_exception("invalid \\x escape sequence", source, pos);
+                    }
+                    char hex[3] = { src[pos], src[pos + 1], '\0' };
+                    str.push_back(static_cast<char>(std::strtol(hex, nullptr, 16)));
+                    pos += 2;
+                    continue;
+                }
                 if (escape_chars.find(escaped_char) == escape_chars.end()) {
                     throw lexer_exception(std::string("unknown escape character \\") + escaped_char, source, pos);
                 }
