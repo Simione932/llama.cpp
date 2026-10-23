@@ -1632,16 +1632,26 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         const int64_t smb = ne12 == 1 ? s13 : s12;
 
         // there is no broadcast and src0, src1 are contiguous across dims 2, 3
-        // use cublasGemmStridedBatchedEx
-        CUBLAS_CHECK(
-        cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                ne01, ne11, ne10,
-                alpha, src0_ptr, cu_data_type_a, s01, sma,     // strideA
-                       src1_ptr, cu_data_type_b, s11, smb,     // strideB
-                beta,   dst_ptr, cu_data_type,   ldc, ne1*ldc, // strideC
-                ne12*ne13,
-                cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (compute_type == GGML_TYPE_F32) {
+            CUBLAS_CHECK(
+            cublasSgemmStridedBatched(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    (const float *) alpha, (const float *) src0_ptr, s01, sma,     // strideA
+                                           (const float *) src1_ptr, s11, smb,     // strideB
+                    (const float *) beta,  (float       *)  dst_ptr, ldc, ne1*ldc, // strideC
+                    ne12*ne13));
+        } else {
+            // use cublasGemmStridedBatchedEx
+            CUBLAS_CHECK(
+            cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, src0_ptr, cu_data_type_a, s01, sma,     // strideA
+                           src1_ptr, cu_data_type_b, s11, smb,     // strideB
+                    beta,   dst_ptr, cu_data_type,   ldc, ne1*ldc, // strideC
+                    ne12*ne13,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1671,15 +1681,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
         CUDA_CHECK(cudaGetLastError());
 
-        CUBLAS_CHECK(
-        cublasGemmBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                ne01, ne11, ne10,
-                alpha, (const void **) (ptrs_src.get() + 0*ne23), cu_data_type_a, s01,
-                       (const void **) (ptrs_src.get() + 1*ne23), cu_data_type_b, s11,
-                beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ldc,
-                ne23,
-                cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (compute_type == GGML_TYPE_F32) {
+            CUBLAS_CHECK(
+            cublasSgemmBatched(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    (const float *) alpha, (const float **) (ptrs_src.get() + 0*ne23), s01,
+                                           (const float **) (ptrs_src.get() + 1*ne23), s11,
+                    (const float *) beta,  (      float **) (ptrs_dst.get() + 0*ne23), ldc,
+                    ne23));
+        } else {
+            CUBLAS_CHECK(
+            cublasGemmBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, (const void **) (ptrs_src.get() + 0*ne23), cu_data_type_a, s01,
+                           (const void **) (ptrs_src.get() + 1*ne23), cu_data_type_b, s11,
+                    beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ldc,
+                    ne23,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     }
 
     // Convert output back to F32 if needed
@@ -1698,10 +1718,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
-        if (GGML_CUDA_CC_IS_AMD(cc) && src1->ne[1] > 32) {
+        if (!fast_fp16_hardware_available(cc)) {
             compute_type = GGML_TYPE_F32;
-        }
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && src1->ne[1] > (cc >= GGML_CUDA_CC_VOLTA ? 8 : 128)) {
+        } else if (GGML_CUDA_CC_IS_AMD(cc) && src1->ne[1] > 32) {
+            compute_type = GGML_TYPE_F32;
+        } else if (GGML_CUDA_CC_IS_NVIDIA(cc) && src1->ne[1] > (cc >= GGML_CUDA_CC_VOLTA ? 8 : 128)) {
             compute_type = GGML_TYPE_F32;
         }
     }
@@ -2111,6 +2132,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(nb2  % nb1  == 0);
 
     const ggml_type type_src1_sorted = (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
+        || (src0->type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc))
         || ggml_is_quantized(src0->type) ? GGML_TYPE_F32 : src0->type;
     const ggml_type type_dst_sorted  = GGML_TYPE_F32;
     const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
