@@ -359,6 +359,7 @@ private:
         std::vector<bool>    used;
 
         void reset() {
+            ids = nullptr;
             ids_data.clear();
             used.clear();
         }
