@@ -12,6 +12,8 @@ struct llama_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_pipeline_copies;
+    uint32_t prefill_reuse;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
@@ -50,6 +52,8 @@ struct llama_cparams {
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+    bool auto_fkvr;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
@@ -60,6 +64,7 @@ struct llama_cparams {
     size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

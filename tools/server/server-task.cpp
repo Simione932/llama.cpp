@@ -1511,6 +1511,16 @@ json server_task_result_rerank::to_json() {
 //
 // server_task_result_tts
 //
+json server_task_result_realtime::to_json() {
+    return json {
+        {"text",          text},
+        {"n_samples",     audio.size()},
+        {"response_done", response_done},
+        {"cancelled",     cancelled},
+        {"n_decoded",     n_decoded},
+    };
+}
+
 json server_task_result_tts::to_json() {
     return json {
         {"sample_rate", sample_rate},
@@ -1826,16 +1836,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - looking for better prompt, base lcp = %d, f_keep = %.3f, f_sim = %.3f\n", lcp_best, f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // Keep the 25% viability guard, then choose the cache state with the largest reusable prefix.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1849,7 +1859,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (lcp_cur > lcp_best) {
+            lcp_best    = lcp_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
