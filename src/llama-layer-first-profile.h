@@ -2,7 +2,13 @@
 // Optional profiling hook. The default executable has no NVTX/CUDA dependency.
 #include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
+#ifdef _MSC_VER
+// MSVC has no weak symbols, so the hook is a no-op there.
+struct lf_profile_scope {
+    lf_profile_scope(const char *, ...) {}
+    void end() {}
+};
+#else
 extern "C" void lf_profile_push(const char *) __attribute__((weak));
 extern "C" void lf_profile_pop() __attribute__((weak));
 struct lf_profile_scope {
@@ -16,3 +22,4 @@ struct lf_profile_scope {
     ~lf_profile_scope(){end();}
     lf_profile_scope(const lf_profile_scope&)=delete;
 };
+#endif
